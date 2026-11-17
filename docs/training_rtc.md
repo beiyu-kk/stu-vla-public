@@ -1,0 +1,354 @@
+# Piper Training RTC
+
+Training RTC 由 `src/openpi/training/config.py` 中的 `TrainConfig.training_rtc` 统一管理。
+`None` 表示普通训练；`TrainingRTCConfig(...)` 表示启用 RTC。训练入口仍是
+`scripts/train_piper.py`，通过 `--config` 选择，不需要另加 RTC 开关。
+
+| 配置 | 训练方式 |
+| --- | --- |
+| `pi05_piper_full_finetune` | 原有全量微调 |
+| `pi05_piper_lora_finetune` | 原有 LoRA 微调 |
+| `pi05_piper_full_finetune_rtc` | 全量 Training RTC |
+| `pi05_piper_lora_finetune_rtc` | 动作侧 LoRA Training RTC |
+| `pi0_fast_piper_full_finetune_rtc` | FAST 全量前缀条件 RTC |
+| `pi0_fast_piper_lora_finetune_rtc` | FAST 主干 LoRA 前缀条件 RTC |
+
+当前实现支持 **JAX π0.5 和 π0-FAST、Piper 单臂 7 维 all-delta 动作**。图像分辨率由所选
+TrainConfig 固定，不允许通过训练脚本覆盖。π0.5 可与 `--region-guidance` 组合，
+FAST 暂不支持 region guidance。PyTorch 训练／模型会拒绝 RTC 配置。
+
+π0.5 使用连续动作 flow matching；FAST 使用下文的前缀条件自回归目标。两者共用
+`TrainingRTCConfig`、episode 划分、归一化、checkpoint 和异步 RTC 客户端协议。
+
+## 启动
+
+```bash
+uv run --no-sync scripts/train_piper.py \
+    --config pi05_piper_lora_finetune_rtc \
+    --dataset-dir /path/to/lerobot_dataset \
+    --dataset-repo-id piper_task \
+    --base-model-dir /path/to/pi05_base/params \
+    --checkpoint-dir /path/to/checkpoints/piper_task_rtc_lora \
+    --exp-name piper_task_rtc_lora \
+    --compute-norm-stats \
+    --batch-size 16 \
+    --no-wandb-enabled
+```
+
+全量 RTC 将 `--config` 改为 `pi05_piper_full_finetune_rtc`，使用新的实验输出目录。
+两个配置的默认 horizon 都是 30，模型动作维度是 32，训练 10,000 步。
+全量默认 batch 32，LoRA 默认 batch 16；`--batch-size`、`--fsdp-devices` 等继续按机器容量设置。
+没有为任何特定 GPU 硬编码设备数量。正式训练前可在独立输出目录使用
+`--num-train-steps 2 --num-workers 0` 做短训练检查。
+
+RTC 的算法和验证参数在配置文件中修改，例如：
+
+```python
+training_rtc=TrainingRTCConfig(
+    finetune_mode="lora",  # 全量配置使用 "full"
+    max_delay=4,
+    delay_weights=None,
+    loss_reduction="official",
+    time_distribution="beta",
+    inherited_lr_scale=0.2,
+    validation_fraction=0.1,
+    split_seed=42,
+    validation_interval=1000,
+    validation_batches=4,
+    norm_source="train_split",
+)
+```
+
+`max_delay` 包含上界：4 表示前缀长度 0–4，且必须小于 horizon。
+默认 `P(d) ∝ exp(-d)`；自定义权重必须有 `max_delay+1` 项，有限、非负且总和为正。
+如需固定 episode 划分，同时设置 `train_episodes` 和 `validation_episodes`，二者应互斥且覆盖全部 episode。
+`validation_interval=0` 只关闭周期验证，不会取消训练／验证划分。
+
+`resolve_training_config()` 在入口参数覆盖后派生模型运行参数、冻结规则及优化器。
+用户修改 `training_rtc`，不需要同时修改 `model.simulated_delay`。
+不要直接在普通模型配置中设置 `simulated_delay` 来绕过统一配置。
+
+## LoRA 与全量的区别
+
+本节描述 π0.5；FAST 的可训练范围见后面的专节。π0.5 RTC LoRA 的可训练范围
+与本仓库原有的普通 LoRA 不同：
+
+| 模块 | RTC LoRA | RTC 全量 |
+| --- | --- | --- |
+| SigLIP、PaliGemma 主干 | 冻结 | 训练 |
+| 已有 PaliGemma LoRA | 保留并冻结 | 不允许未经合并的 adapters |
+| Action expert 原始 attention／FFN | 冻结 | 训练 |
+| Action expert LoRA（rank 32） | 训练 | 不创建 |
+| Action expert 的 adaRMS Dense | 训练 | 训练 |
+| 时间 MLP、动作输入／输出投影 | 训练 | 训练 |
+
+LoRA 使用真正的 AdamW 参数分组：LoRA 峰值学习率 `2.5e-5`，继承的可训练参数
+使用 `0.2` 倍，即 `5e-6`。全量使用统一 AdamW，峰值 `1e-5`。
+学习率计划位于两个配置的 `lr_schedule` 中。这些值是调参起点，不代表当前任务的最优值。
+两个 RTC 配置都关闭 EMA，验证和推理参数保存使用当前模型。
+
+初始化时先检查底座参数元数据。有 VLM adapters 时保留其结构并冻结；底座没有时不创建
+随机 VLM adapters。专用权重加载器拒绝静默丢弃已有 adapters，并保留自定义图像尺寸所需的
+SigLIP 位置编码插值能力。全量模式加载含 LoRA 的底座会报错，需要先单独合并 adapters。
+
+## 动作与 loss
+
+π0.5 每个训练样本采样前缀长度 `d`，前 `d` 个真实动作保持干净，时间条件设为 0；其余动作
+使用相同的噪声时间 `t`。沿用 OpenPI 的 `t=1` 噪声、`t=0` 干净动作约定。
+前缀提供条件，不计入 loss。episode 尾部 padding 同时从 loss 和 attention 中排除。
+图像增强开关不会关闭 RTC；验证使用相同 RTC 目标。
+
+默认归约为：
+
+```text
+official_loss = 有效后缀位置的所有动作维平方误差之和 / 有效后缀 token 数
+per_element_loss = official_loss / model_action_dim
+```
+
+对当前 32 维模型，两个 loss 相差 32 倍，不能直接拿 `official` 日志与旧训练逐元素 mean 比大小。
+归约在全局 batch 上完成，不先对每个样本或每个设备单独归一化。没有有效目标的 batch
+不更新参数或 Adam 状态；训练迭代计数仍推进。
+
+每个动作窗口的坐标统一为 `action[t+i] - state[t]`，7 维均为 delta，包含夹爪。
+归一化后 pad 到 32 维。日志的 `rtc/raw_mse` 是前 7 维的归一化 flow 速度误差，
+不是机器人单位下的执行误差。
+
+## π0-FAST 的 TT-RTC 适配
+
+FAST 将整个动作片段进行 DCT + BPE 编码，动作 token 与动作帧没有一一对应关系。
+本实现按动作帧切分 `prefix=actions[:d]` 和 `suffix=actions[d:valid_length]`，
+分别编码；已承诺前缀作为双向可见的条件，未来后缀使用自回归交叉熵监督。
+这是将训练期延迟模拟与已承诺动作条件化适配到 FAST，不使用 π0.5 的连续 flow loss，
+也不在完整 FAST token 序列上按 delay 截断。
+
+输入条件包含图像、任务、当前 state、`Delay`、后缀 `Horizon` 和独立编码的前缀。
+监督目标为 `Action:`、独立编码的后缀及结束标记。前缀和 episode 尾部 padding 不计入 loss。
+CPU 数据转换为每个允许的 delay 构建候选，训练步骤使用 JAX RNG 抽取每个样本的 delay，
+只有选中的候选参与模型前向；验证对每个 delay 分别评估。
+
+```text
+FAST RTC loss = 有效后缀目标 token 的负对数似然总和 / 有效后缀目标 token 数
+```
+
+FAST 的 `active_tokens` 是 BPE／分隔符目标 token 数，不是动作帧数。训练日志包含
+`rtc/token_ce`；验证包含 `rtc_val/d{d}/token_ce` 和 `token_accuracy`，不输出 flow MSE。
+`loss_reduction="official"` 在 FAST 下表示上述 token 平均交叉熵；
+`time_distribution="beta"` 仅保留为共用配置的默认值，不采样 flow 时间。
+更改这两个 flow 专用选项会报错。无有效后缀的 batch 不更新参数和 Adam 状态。
+
+配置仍放在 `src/openpi/training/configs/pi0_fast.py`，可选择：
+
+| 全量配置 | 图像策略 |
+| --- | --- |
+| `pi0_fast_piper_full_finetune_rtc` | 224×224，resize + padding |
+| `pi0_fast_piper_full_finetune_rtc_image448` | 448×448，resize + padding |
+| `pi0_fast_piper_full_finetune_rtc_image640` | 640×640，resize + padding |
+| `pi0_fast_piper_full_finetune_rtc_image640_pad_only` | 640×640，仅 padding，禁止缩放 |
+| `pi0_fast_piper_full_finetune_rtc_pad_to_square` | 每张图按自身最长边补方形，允许动态尺寸 |
+
+将配置名称中的 `full` 换成 `lora` 可选择对应的 LoRA 配置。分辨率和 padding 策略
+由 train config 定义；需要其他尺寸时新增配置。`pad_only` 会拒绝超过画布尺寸的输入，
+640×480 输入会原尺寸居中补到 640×640，训练也关闭几何缩放增强。
+
+在 model 中设置 `pad_to_square=True`（默认 `False`）即可启用动态补方形，
+与 `image_resolution` 并列。开启后没有固定输入画布上限；例如 1280×720 会补成 1280×1280。
+训练组 batch 时，同一相机补到该 batch 的最大边长，保留全部源像素；不同 batch／相机
+允许不同尺寸。位置编码按实际 patch 网格插值，参数形状保持固定，新尺寸会触发 JAX 编译。
+π0.5 也提供 `pi05_piper_{full,lora}_finetune_rtc_pad_to_square`。
+详细规则见 [训练文档](../docs_piper/train/run.md#保留原始像素按最长边补成方形)。
+
+所有 FAST RTC 配置默认 `action_horizon=30`、`action_dim=7`、`max_delay=4`、
+`max_token_len=512`、batch 16、训练 10,000 步并关闭 EMA。512 包含文本条件、前缀
+和后缀目标；发生溢出会直接报错，需在新 train config 中增加 `max_token_len`，
+不能截断 DCT/BPE 序列。增大 delay 范围还会增加 CPU tokenization 和候选数据量。
+
+FAST 全量训练 SigLIP 和自回归主干；FAST RTC LoRA 仅训练主干的 attention／FFN
+LoRA，冻结 SigLIP、embedding 和所有原始主干权重。FAST 没有连续 action expert、
+adaRMS 或时间 MLP。LoRA 峰值学习率为 `2.5e-5`，全量为 `1e-5`；
+LoRA 下没有额外的继承参数组需要训练，`inherited_lr_scale` 不影响这些冻结权重。
+已有 FAST LoRA checkpoint 的 adapters 会保留并继续训练；全量模式要求先合并 adapters。
+
+448 分辨率的 FAST RTC 启动示例：
+
+```bash
+uv run --no-sync scripts/train_piper.py \
+    --config pi0_fast_piper_lora_finetune_rtc_image448 \
+    --dataset-dir /path/to/lerobot_dataset \
+    --dataset-repo-id piper_task \
+    --base-model-dir /path/to/pi0_fast_base/params \
+    --checkpoint-dir /path/to/checkpoints/piper_fast_rtc_image448 \
+    --exp-name piper_fast_rtc_image448 \
+    --compute-norm-stats \
+    --batch-size 16 \
+    --no-wandb-enabled
+```
+
+全量模式改为 `pi0_fast_piper_full_finetune_rtc_image448`。普通 FAST checkpoint 可用于
+初始化新 RTC 实验，但普通 FAST 权重没有学过这套前缀／后缀格式，必须进行 RTC 微调。
+正式训练前可在独立目录加 `--num-train-steps 2 --num-workers 0` 做短训练检查。
+
+推理服务示例：
+
+```bash
+uv run --no-sync scripts/serve_policy.py --port=8000 policy:checkpoint \
+    --policy.config=pi0_fast_piper_lora_finetune_rtc_image448 \
+    --policy.dir=/path/to/checkpoints/piper_fast_rtc_image448/9999
+```
+
+FAST 服务沿用下文 `rtc.prefix`／`delay`／`start_index`／`request_id` 协议及
+`examples/piper/rtc_main.py`。生成的是 `H-delay` 个动作的独立 FAST 后缀；服务端
+解码、拼接并恢复已承诺的绝对前缀，返回 `[H,7]`。解码格式、长度或有限值不正确会
+报错，不返回静默补零的动作。未提供 RTC 字段时按 delay 0 生成。
+
+通过 Python 加载策略时，FAST 接受 `sample_kwargs={"max_decoding_steps": 512,
+"temperature": 0.0}`，默认解码上限取模型的 `max_token_len`。该上限是生成 token
+数量，不是动作 horizon；不接受 flow 专用的 `num_steps` 或 `noise`。
+服务只接受训练范围内的 delay。默认 4 帧在 30 Hz 下只覆盖约 133 ms，448／640 图像
+和自回归生成的实际延迟需要测量；若超出范围，应新建更大 `max_delay` 的 RTC 配置并训练。
+
+FAST checkpoint manifest 额外记录 `model_type="pi0_fast"` 和
+`rtc_objective="fast_prefix_suffix_v1"`，恢复和部署会校验模型类型与编码目标，
+不允许混用 π0.5 checkpoint 或未知 FAST RTC 编码格式。
+
+## 数据、归一化和验证
+
+默认按 episode 固定划分 90% 训练、10% 验证，不按相邻帧随机拆分。
+RTC 使用专门的数据集适配修复当前 LeRobot 版本在非连续 episode 子集上的窗口边界查询。
+原始 episode/frame ID 保留，region guidance 标注仍按这些 ID 查找。
+
+首次使用 `--compute-norm-stats` 会读取训练 episode 的 Parquet 数值列，计算 state 和
+相对窗口起始 state 的 delta-action 统计量，不解码视频，并排除越界 padding。
+默认保存到 `<dataset-dir>/rtc_norm_stats/<划分与horizon摘要>/`：
+
+- `norm_stats.json`
+- `norm_stats_manifest.json`
+
+两个微调模式在相同划分和 horizon 下共享统计量。改变 delay 权重不需要重算统计量。
+`--norm-stats-dir` 可以覆盖保存／读取位置；`train_split` 模式必须有匹配的统计 manifest，
+旧的全数据统计不会仅因为文件存在就被复用。传入 `--compute-norm-stats` 时，入口也会
+重新计算不匹配的 RTC 统计量；已有任务底座的统计量使用 `checkpoint` 模式继承。RTC 正式统计不接受 `--max-norm-frames`。
+
+从已有任务 checkpoint 适配时，可以在配置中将 `norm_source` 改成 `"checkpoint"`，
+复用底座 `assets/<asset_id>/norm_stats.json`。入口会尝试从底座 assets 中定位唯一的统计文件，
+也可以用 `--norm-stats-dir` 显式指定其目录。此模式不重新拟合统计量；其训练／验证划分
+只针对本次 RTC 适配，底座及继承统计量可能已经使用过这些验证 episode。
+继承统计量必须符合相同的 7 维 all-delta 动作约定。
+
+周期验证固定覆盖不同 episode／时间位置，对每个 delay 分别计算误差，跨 batch 累计
+误差总和与有效 token 数后再相除。验证样本不足时缩小验证 batch，避免重复计算样本。
+指标写入 W&B（启用时）及实验目录的 `rtc_validation.jsonl`；没有有效目标的 delay
+指标记为 null，而不是零误差。
+
+## 保存和恢复
+
+实验目录保存 `training_rtc.json`；每个 checkpoint 的 `assets/rtc_manifest.json`
+保存模型结构、RTC 参数、优化器／学习率设置、动作坐标、统计量摘要和 episode 划分。
+参数、优化器状态和 step 沿用原 Orbax 保存机制，包括 step 0 的恢复。
+
+相同实验在原命令追加 `--resume`。恢复时检查配置、数据及归一化一致性；数据迭代器的位置
+沿用原训练框架的行为，不保证恢复到完全相同的下一批样本。
+
+从普通模型开始 RTC，应使用原 checkpoint 的 `params` 作为 `--base-model-dir`，
+并使用新的实验目录。不能直接对普通实验添加 RTC 配置并 `--resume`，也不能跨 full／LoRA 续训。
+
+## 推理接口
+
+现有 `scripts/serve_policy.py` 可以加载 RTC checkpoint：
+
+```bash
+uv run --no-sync scripts/serve_policy.py --port=8000 policy:checkpoint \
+    --policy.config=pi05_piper_lora_finetune_rtc \
+    --policy.dir=/path/to/checkpoints/piper_task_rtc_lora/9999
+```
+
+加载时从 checkpoint manifest 恢复模型实际设置，包括图像尺寸、adapters 和 delay 范围，
+并使用 checkpoint 内的统计量。`infer(obs)` 支持额外的 RTC 字段：
+
+```python
+obs = {
+    "observation/top_image": head_rgb,
+    "observation/right_wrist_image": wrist_rgb,
+    "observation/state": current_state,  # [7]
+    "prompt": task,
+    "rtc": {
+        "prefix": absolute_commands,  # [delay, 7]，机器人原始单位
+        "delay": delay,
+        "start_index": observation_tick,
+        "request_id": request_id,
+    },
+}
+```
+
+`prefix[0]` 对应观测时刻接下来要执行的命令。策略层先提取 RTC 字段，再用本次观测 state
+将绝对前缀转换到训练的 delta／归一化坐标。π0.5 每次去噪迭代均固定前缀，
+FAST 将前缀作为条件生成后缀；反归一化后还原原始
+前缀命令，避免已承诺动作因数值误差改变。不提供 RTC 字段时按 delay 0 运行。
+
+异步 Piper 客户端为 `examples/piper/rtc_main.py`，同步基线仍使用 `examples/piper/main.py`：
+
+```bash
+uv run --no-sync examples/piper/rtc_main.py \
+    --host=127.0.0.1 --port=8000 --rtc-delay=4 --control-hz=30 \
+    --prompt='Pick up the red soldier and place it off the board.'
+```
+
+先确认相机序列号、CAN 和任务提示。客户端启动会使能机械臂，先做一次冷启动和
+`--warmup-requests=3` 次预热推理，再发送动作。不指定 `--rtc-delay` 时，以预热往返耗时
+最大值加一 tick 估计 delay；首次 JAX 编译耗时不计入估计。`--inference-timeout-s=30`
+限制等待推理的时间；冷启动较慢时可调大。`max_delay=4` 在 30 Hz 下只覆盖约 133 ms。
+
+前缀包含关节限位、SDK 量化及夹爪保持／二值化后的命令。提前返回仍执行完已承诺的
+原队列；响应必须回显请求字段并保持前缀不变，随后才接续后缀。超出承诺时间时保持
+上一目标，丢弃迟到的续写，用新的观测和保持命令重试；连续
+`--max-consecutive-misses=3` 次失败后退出。此策略不会保证持续高延迟时仍有动作进展。
+
+当前控制线程仍同步读取两路相机，预览也占用控制时间，因此 `--control-hz` 是目标上限，
+不是实时频率保证。机械臂 SDK 断开不等同于急停。降低控制频率会改变训练动作的播放
+速度，实测时还应记录控制间隔、相机等待时间、预热后端到端延迟及任务成功率。
+离线 flow loss 也不等价于实机动作平滑度或任务成功率。
+
+Piper 真机依赖不属于 OpenPI 的基础依赖，需要安装到运行 `rtc_main.py` 的同一个 Python
+环境：
+
+```bash
+uv pip install --python .venv/bin/python pyrealsense2
+uv pip install --python .venv/bin/python \
+  -e /home/ubun/project/piper/data_collection/piper_data_collection/thirdparty/piper_sdk
+```
+
+如果出现 `ModuleNotFoundError: pyrealsense2` 或 `piper_sdk`，说明包安装到了另一个
+conda/venv 环境；`uv run` 不需要执行 `deactivate`，直接用上面两条命令安装即可。
+
+## 验证
+
+```bash
+JAX_PLATFORMS=cpu XLA_FLAGS=--xla_force_host_platform_device_count=2 \
+    .venv/bin/python -m pytest tests/rtc src/openpi/models/tokenizer_test.py -q
+```
+
+测试覆盖真实小模型的前向／反向／JIT、full 与 LoRA 冻结范围、region guidance、padding、
+固定前缀、参数分组、统计量、checkpoint 保存／续训及策略加载。
+FAST 还覆盖真实 tokenizer 的独立前缀／后缀编解码、溢出／不完整后缀拒绝、
+full／LoRA 更新、空后缀跳过、checkpoint 续训和策略加载。
+双虚拟 CPU 设备测试用于检查分片与恢复，不代表完整 π0.5／FAST 的 GPU 显存、吞吐
+或机械臂实测。策略加载测试使用小型真实模型和测试 tokenizer，真实 tokenizer 编解码单独验证。
+
+客户端无硬件回归（包括本地 websocket 关闭测试）：
+
+```bash
+.venv/bin/python -m pytest tests/test_piper_rtc_client.py -q
+```
+
+算法移植参考本机 `openpi-training-rtc/src/openpi` 实现，保留当前仓库的分辨率、区域偏置、
+本地 dataset_root 和 Piper 输入格式；配置统一管理及回归测试在本仓库实现。
+
+
+本机参数形状核对（224 分辨率）：全量模型总参数／可训练参数均为 3,353,433,872；
+默认 RTC LoRA 总参数 3,375,552,272，可训练参数 140,789,792。
+这是抽象参数树检查，没有分配完整模型训练权重。
+
+当前象棋数据的实际预检：100 条 episode 按默认设置划分为 90 条训练、10 条验证；
+训练集 29,216 帧，horizon 30 对应 837,330 个有效动作 token。
+训练及验证 loader 均得到动作 `[2,30,32]` 和 padding `[2,30]`，
+轨迹末帧有 29 个 padding token。统计预检只写入临时目录并在结束后清理。
+尚未启动该数据上的完整模型 GPU 训练。

@@ -1,0 +1,332 @@
+import argparse
+import dataclasses
+import json
+import sys
+
+import numpy as np
+import pytest
+
+from openpi import transforms
+from openpi.models import pi0_fast
+from openpi.training import config as _config
+from scripts import compute_norm_stats
+from scripts import train_piper
+
+
+def test_resolve_base_params_path(tmp_path):
+    params_dir = tmp_path / "pi05_base" / "params"
+    params_dir.mkdir(parents=True)
+
+    assert train_piper._resolve_base_params_path(str(params_dir.parent)) == str(params_dir)  # noqa: SLF001
+    assert (
+        train_piper._resolve_base_params_path("gs://bucket/pi05_base")  # noqa: SLF001
+        == "gs://bucket/pi05_base/params"
+    )
+
+
+@pytest.mark.parametrize(
+    "config_name",
+    [
+        "pi05_piper_full_finetune",
+        "pi05_piper_lora_finetune",
+        "pi0_fast_piper_full_finetune",
+        "pi0_fast_piper_full_finetune_image448",
+        "pi0_fast_piper_lora_finetune",
+        "pi0_fast_piper_lora_finetune_image448",
+        "pi0_fast_piper_full_finetune_image640_pad_only",
+        "pi05_piper_lora_finetune_image640_pad_only",
+        "pi0_fast_piper_full_finetune_pad_to_square",
+        "pi05_piper_lora_finetune_pad_to_square",
+    ],
+)
+def test_build_config_with_custom_paths(tmp_path, monkeypatch, config_name):
+    dataset_dir = tmp_path / "dataset"
+    (dataset_dir / "meta").mkdir(parents=True)
+    (dataset_dir / "meta" / "info.json").write_text("{}")
+    (dataset_dir / "data").mkdir()
+    base_model_name = "pi0_fast_base" if config_name.startswith("pi0_fast") else "pi05_base"
+    params_dir = tmp_path / base_model_name / "params"
+    params_dir.mkdir(parents=True)
+    norm_stats_dir = tmp_path / "normalization"
+    checkpoint_dir = tmp_path / "output"
+    args = argparse.Namespace(
+        config=config_name,
+        dataset_dir=str(dataset_dir),
+        dataset_repo_id="local/piper",
+        base_model_dir=str(params_dir.parent),
+        checkpoint_base_dir=str(tmp_path / "checkpoints"),
+        checkpoint_dir=str(checkpoint_dir),
+        norm_stats_dir=str(norm_stats_dir),
+        exp_name="test",
+        overwrite=False,
+        resume=False,
+        batch_size=None,
+        num_workers=None,
+        num_train_steps=None,
+        fsdp_devices=None,
+        wandb_enabled=False,
+    )
+
+    config = train_piper._build_config(args)  # noqa: SLF001
+    data_config = config.data.create_base_config(config.assets_dirs, config.model)
+    base = _config.get_config(config_name)
+    expected_size = 640 if "image640" in config_name else 448 if "image448" in config_name else 224
+
+    assert config.name == base.name
+    expected_batch_size = 16 if "lora" in config_name or config_name.startswith("pi0_fast") else 32
+    assert config.batch_size == expected_batch_size
+    assert config.model.image_resolution == (expected_size, expected_size)
+    assert base.model.image_resolution == (expected_size, expected_size)
+    assert config.model.paligemma_variant == base.model.paligemma_variant
+    assert config.freeze_filter == base.freeze_filter
+    assert config.optimizer is base.optimizer
+    assert config.model is base.model
+    expected_mode = "pad_only" if config_name.endswith("pad_only") else "resize_with_pad"
+    assert config.model.pad_to_square == config_name.endswith("pad_to_square")
+    assert config.model.image_resize_mode == expected_mode
+    assert config.weight_loader.resize_siglip_posemb
+    assert config.weight_loader.params_path == str(params_dir)
+    assert config.checkpoint_dir == checkpoint_dir
+    assert data_config.dataset_root == str(dataset_dir)
+    assert data_config.asset_id == "local/piper"
+    assert compute_norm_stats.get_norm_stats_dir(config, data_config) == norm_stats_dir
+
+    monkeypatch.setattr(_config._tokenizer, "PaligemmaTokenizer", lambda *_: None)  # noqa: SLF001
+    monkeypatch.setattr(_config._tokenizer, "FASTTokenizer", lambda *_args, **_kwargs: object())  # noqa: SLF001
+    group = _config.ModelTransformFactory()(config.model)
+    resize = next(transform for transform in group.inputs if isinstance(transform, transforms.ResizeImages))
+    image = np.full((423, 628, 3), 127, dtype=np.uint8)
+    result = resize({"image": {"base_0_rgb": image}})
+    output_size = 628 if config.model.pad_to_square else expected_size
+    assert result["image"]["base_0_rgb"].shape == (output_size, output_size, 3)
+    if config_name.startswith("pi0_fast"):
+        assert isinstance(config.model, pi0_fast.Pi0FASTConfig)
+
+
+@pytest.mark.parametrize(
+    ("provided_argument", "value", "missing_argument"),
+    [
+        ("--dataset-repo-id", "local/piper", "--dataset-dir"),
+        ("--dataset-dir", "/tmp/piper", "--dataset-repo-id"),
+    ],
+)
+def test_dataset_arguments_are_required(monkeypatch, capsys, provided_argument, value, missing_argument):
+    monkeypatch.setattr(sys, "argv", ["train_piper.py", provided_argument, value, "--exp-name", "test"])
+
+    with pytest.raises(SystemExit, match="2"):
+        train_piper._parse_args()  # noqa: SLF001
+
+    assert missing_argument in capsys.readouterr().err
+
+
+def test_legacy_image_size_argument_is_rejected(monkeypatch, capsys):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "train_piper.py",
+            "--dataset-dir",
+            "/tmp/piper",
+            "--dataset-repo-id",
+            "local/piper",
+            "--exp-name",
+            "test",
+            "--image-size",
+            "448",
+        ],
+    )
+    with pytest.raises(SystemExit, match="2"):
+        train_piper._parse_args()  # noqa: SLF001
+    assert "--image-size" in capsys.readouterr().err
+
+
+def test_launcher_uses_registered_train_config_defaults(tmp_path, monkeypatch):
+    dataset_dir = tmp_path / "dataset"
+    (dataset_dir / "meta").mkdir(parents=True)
+    (dataset_dir / "meta/info.json").write_text("{}")
+    (dataset_dir / "data").mkdir()
+    base = _config.get_config("pi05_piper_lora_finetune")
+    registered = dataclasses.replace(
+        base,
+        name="custom_piper",
+        batch_size=8,
+        num_train_steps=1234,
+        checkpoint_base_dir=str(tmp_path / "custom_checkpoints"),
+        checkpoint_dir_override=str(tmp_path / "custom_run"),
+        weight_loader=dataclasses.replace(base.weight_loader, params_path="gs://bucket/custom/params"),
+        data=dataclasses.replace(base.data, assets=_config.AssetsConfig(assets_dir="/custom/assets")),
+    )
+    monkeypatch.setitem(_config._CONFIGS_DICT, registered.name, registered)  # noqa: SLF001
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "train_piper.py",
+            "--config",
+            registered.name,
+            "--dataset-dir",
+            str(dataset_dir),
+            "--dataset-repo-id",
+            "local/piper",
+            "--exp-name",
+            "test",
+        ],
+    )
+
+    config = train_piper._build_config(train_piper._parse_args())  # noqa: SLF001
+    assert config.name == registered.name
+    assert config.batch_size == registered.batch_size
+    assert config.num_train_steps == registered.num_train_steps
+    assert config.checkpoint_base_dir == registered.checkpoint_base_dir
+    assert config.checkpoint_dir == registered.checkpoint_dir
+    assert config.weight_loader is registered.weight_loader
+    assert config.data.assets.assets_dir == registered.data.assets.assets_dir
+    assert config.model is registered.model
+
+
+def test_launcher_uses_registered_448_resolution(tmp_path, monkeypatch):
+    dataset_dir = tmp_path / "dataset"
+    (dataset_dir / "meta").mkdir(parents=True)
+    (dataset_dir / "meta" / "info.json").write_text("{}")
+    (dataset_dir / "data").mkdir()
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "train_piper.py",
+            "--config",
+            "pi0_fast_piper_full_finetune_image448",
+            "--dataset-dir",
+            str(dataset_dir),
+            "--dataset-repo-id",
+            "local/piper",
+            "--exp-name",
+            "test",
+            "--base-model-dir",
+            "gs://bucket/pi05_base",
+        ],
+    )
+    config = train_piper._build_config(train_piper._parse_args())  # noqa: SLF001
+    assert config.model.image_resolution == (448, 448)
+    assert config.weight_loader.resize_siglip_posemb
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_region_guidance_is_opt_in(tmp_path, monkeypatch, enabled):
+    dataset_dir = tmp_path / "dataset"
+    (dataset_dir / "meta").mkdir(parents=True)
+    (dataset_dir / "data").mkdir()
+    info = {}
+    if enabled:
+        feature = {"dtype": "float32", "shape": [4], "names": ["x1", "y1", "x2", "y2"]}
+        info["features"] = {
+            "observation.region.hand_right.book_bbox_xyxy": feature,
+            "observation.region.hand_right.title_bbox_xyxy": feature,
+        }
+    (dataset_dir / "meta/info.json").write_text(json.dumps(info))
+    argv = [
+        "train_piper.py",
+        "--config",
+        "pi05_piper_lora_finetune",
+        "--dataset-dir",
+        str(dataset_dir),
+        "--dataset-repo-id",
+        "local/book",
+        "--exp-name",
+        "test",
+        "--base-model-dir",
+        "gs://bucket/base",
+    ]
+    if enabled:
+        argv += ["--region-guidance"]
+    monkeypatch.setattr(sys, "argv", argv)
+    base = _config.get_config("pi05_piper_lora_finetune")
+    config = train_piper._build_config(train_piper._parse_args())  # noqa: SLF001
+    assert config.model.image_resolution == (224, 224)
+    assert base.model.image_resolution == (224, 224)
+    assert config.freeze_filter == base.freeze_filter
+    assert config.data.base_config.prompt_from_task
+    assert base.model.region_guidance is None
+    assert not base.data.base_config.region_annotations_embedded
+    if enabled:
+        assert config.model.region_guidance.attention_bias_scale == 0.5
+        assert config.data.base_config.region_annotations_embedded
+    else:
+        assert config.model.region_guidance is None
+        assert not config.data.base_config.region_annotations_embedded
+
+
+def test_region_guidance_prefers_embedded_annotations(tmp_path, monkeypatch):
+    dataset_dir = tmp_path / "dataset"
+    (dataset_dir / "meta").mkdir(parents=True)
+    (dataset_dir / "data").mkdir()
+    feature = {"dtype": "float32", "shape": [4], "names": ["x1", "y1", "x2", "y2"]}
+    (dataset_dir / "meta/info.json").write_text(
+        json.dumps(
+            {
+                "features": {
+                    "observation.region.hand_right.book_bbox_xyxy": feature,
+                    "observation.region.hand_right.title_bbox_xyxy": feature,
+                }
+            }
+        )
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "train_piper.py",
+            "--config",
+            "pi05_piper_lora_finetune",
+            "--dataset-dir",
+            str(dataset_dir),
+            "--dataset-repo-id",
+            "local/book",
+            "--exp-name",
+            "test",
+            "--base-model-dir",
+            "gs://bucket/base",
+            "--region-guidance",
+        ],
+    )
+
+    config = train_piper._build_config(train_piper._parse_args())  # noqa: SLF001
+    assert config.data.base_config.region_annotations_embedded
+
+
+def test_attention_bias_scale_can_be_overridden_without_rebuilding_the_config(tmp_path, monkeypatch):
+    dataset_dir = tmp_path / "dataset"
+    (dataset_dir / "meta").mkdir(parents=True)
+    (dataset_dir / "data").mkdir(parents=True)
+    feature = {"dtype": "float32", "shape": [4], "names": ["x1", "y1", "x2", "y2"]}
+    (dataset_dir / "meta/info.json").write_text(
+        json.dumps(
+            {
+                "features": {
+                    "observation.region.hand_right.book_bbox_xyxy": feature,
+                    "observation.region.hand_right.title_bbox_xyxy": feature,
+                }
+            }
+        )
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "train_piper.py",
+            "--config",
+            "pi05_piper_full_finetune_rtc_attention_bias",
+            "--dataset-dir",
+            str(dataset_dir),
+            "--dataset-repo-id",
+            "local/book",
+            "--exp-name",
+            "test",
+            "--base-model-dir",
+            "gs://bucket/base",
+            "--attention-bias-scale",
+            "1.75",
+        ],
+    )
+    config = train_piper._build_config(train_piper._parse_args())  # noqa: SLF001
+    assert config.model.region_guidance.attention_bias_scale == 1.75
